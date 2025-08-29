@@ -13,6 +13,8 @@ from io import BytesIO
 from PIL import Image, ImageOps, ImageEnhance
 import base64
 import requests
+import sqlite3
+import bcrypt
 
 # -----------------------------
 # THIRD-PARTY IMPORTS
@@ -49,6 +51,7 @@ st.set_page_config(
 APP_DIR = Path.cwd()
 UPLOAD_DIR = APP_DIR / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = Path.cwd() / "socialverse.db"
 
 # Supported media formats
 IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']
@@ -535,12 +538,13 @@ def init_session_state():
     """Initialize all session state variables."""
     defaults = {
         "username": "",
+        "is_authenticated": False,
         "user_profile": {
             "bio": "",
             "avatar": None,
+            "posts": 0,
             "followers": 0,
-            "following": 0,
-            "posts": 0
+            "following": 0
         },
         "chat_requests": defaultdict(list),
         "active_chats": defaultdict(lambda: defaultdict(lambda: deque(maxlen=200))),
@@ -558,7 +562,8 @@ def init_session_state():
         "hashtags_followed": set(),
         "trending_hashtags": {},
         "last_notification_check": datetime.now().timestamp(),
-        "current_marketplace_index": 0
+        "current_marketplace_index": 0,
+        "current_reel_index": 0
     }
     
     for key, value in defaults.items():
@@ -568,10 +573,196 @@ def init_session_state():
 init_session_state()
 
 # -----------------------------
+# AUTHENTICATION
+# -----------------------------
+def init_db():
+    """Initialize SQLite database for users."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY,
+            password_hash TEXT NOT NULL,
+            bio TEXT,
+            avatar_path TEXT,
+            posts INTEGER DEFAULT 0,
+            followers INTEGER DEFAULT 0,
+            following INTEGER DEFAULT 0,
+            created_at TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def hash_password(password: str) -> bytes:
+    """Hash a password using bcrypt."""
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
+
+def verify_password(password: str, hashed: bytes) -> bool:
+    """Verify a password against its hash."""
+    try:
+        return bcrypt.checkpw(password.encode('utf-8'), hashed)
+    except:
+        return False
+
+def sign_up(username: str, password: str) -> Tuple[bool, str]:
+    """Register a new user."""
+    if not username.strip() or len(username) < 3:
+        return False, "Username must be at least 3 characters long."
+    if len(password) < 6:
+        return False, "Password must be at least 6 characters long."
+    
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    try:
+        c.execute("SELECT username FROM users WHERE username = ?", (username,))
+        if c.fetchone():
+            return False, "Username already exists."
+        
+        hashed = hash_password(password)
+        created_at = datetime.now().strftime(ISO_FMT)
+        c.execute(
+            "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
+            (username, hashed, created_at)
+        )
+        conn.commit()
+        return True, "Account created successfully!"
+    except Exception as e:
+        return False, f"Error creating account: {str(e)}"
+    finally:
+        conn.close()
+
+def log_in(username: str, password: str) -> Tuple[bool, str]:
+    """Log in a user."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    try:
+        c.execute("SELECT password_hash FROM users WHERE username = ?", (username,))
+        result = c.fetchone()
+        if not result:
+            return False, "Invalid username or password."
+        
+        hashed = result[0]
+        if verify_password(password, hashed):
+            return True, "Login successful!"
+        return False, "Invalid username or password."
+    except Exception as e:
+        return False, f"Error logging in: {str(e)}"
+    finally:
+        conn.close()
+
+def load_user_profile(username: str) -> dict:
+    """Load user profile from database."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute(
+        "SELECT bio, avatar_path, posts, followers, following FROM users WHERE username = ?",
+        (username,)
+    )
+    result = c.fetchone()
+    conn.close()
+    
+    if result:
+        return {
+            "bio": result[0] or "",
+            "avatar": result[1],
+            "posts": result[2],
+            "followers": result[3],
+            "following": result[4]
+        }
+    return {
+        "bio": "",
+        "avatar": None,
+        "posts": 0,
+        "followers": 0,
+        "following": 0
+    }
+
+def update_user_profile(username: str, bio: Optional[str] = None, avatar_path: Optional[str] = None):
+    """Update user profile in database."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    try:
+        if bio is not None:
+            c.execute("UPDATE users SET bio = ? WHERE username = ?", (bio, username))
+        if avatar_path is not None:
+            c.execute("UPDATE users SET avatar_path = ? WHERE username = ?", (avatar_path, username))
+        conn.commit()
+    except Exception as e:
+        st.error(f"Error updating profile: {str(e)}")
+    finally:
+        conn.close()
+
+def render_authentication():
+    """Render login and sign-up interface."""
+    with st.sidebar:
+        st.title("👤 Authentication")
+        
+        auth_mode = st.selectbox("Mode", ["Login", "Sign Up"], key="auth_mode")
+        
+        with st.form("auth_form", clear_on_submit=True):
+            username = st.text_input("Username", key="auth_username")
+            password = st.text_input("Password", type="password", key="auth_password")
+            
+            if auth_mode == "Sign Up":
+                submit_label = "Create Account"
+            else:
+                submit_label = "Log In"
+            
+            col1, col2 = st.columns([2, 1])
+            submitted = col1.form_submit_button(submit_label)
+            guest_mode = col2.form_submit_button("Continue as Guest")
+            
+            if submitted:
+                if auth_mode == "Sign Up":
+                    success, message = sign_up(username, password)
+                else:
+                    success, message = log_in(username, password)
+                
+                if success:
+                    st.session_state.username = username
+                    st.session_state.is_authenticated = True
+                    st.session_state.user_profile = load_user_profile(username)
+                    st.success(message)
+                    st.rerun()
+                else:
+                    st.error(message)
+            
+            if guest_mode:
+                st.session_state.username = ""
+                st.session_state.is_authenticated = False
+                st.session_state.user_profile = {
+                    "bio": "",
+                    "avatar": None,
+                    "posts": 0,
+                    "followers": 0,
+                    "following": 0
+                }
+                st.info("Continuing as guest. Some features are restricted.")
+                st.rerun()
+
+def ensure_logged_in(allow_guest: bool = False) -> bool:
+    """Check if user is logged in or guest mode is allowed."""
+    if st.session_state.get("is_authenticated", False):
+        return True
+    if allow_guest and not st.session_state.get("is_authenticated", False):
+        return True
+    st.warning("Please log in or sign up to access this feature.")
+    return False
+
+# -----------------------------
 # ADVANCED CHAT SYSTEM
 # -----------------------------
 def request_chat(from_user: str, to_user: str) -> bool:
     """Send a chat request from one user to another."""
+    if not st.session_state.get("is_authenticated", False):
+        st.error("You must be logged in to send a chat request.")
+        return False
+    
     if (not to_user or from_user == to_user or 
         to_user in st.session_state.blocked or
         from_user in st.session_state.blocked):
@@ -654,6 +845,10 @@ def create_post(user: str, text: str, media_file, is_sell: bool = False,
                location: str = None, hashtags: List[str] = None, 
                title: str = None, category: str = None, condition: str = None) -> bool:
     """Create a new feed post."""
+    if not st.session_state.get("is_authenticated", False):
+        st.error("You must be logged in to create a post.")
+        return False
+    
     if not moderate_text(text):
         return False
     
@@ -703,6 +898,11 @@ def create_post(user: str, text: str, media_file, is_sell: bool = False,
     st.session_state.feed_posts.appendleft(post)
     
     st.session_state.user_profile["posts"] += 1
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE users SET posts = posts + 1 WHERE username = ?", (user,))
+    conn.commit()
+    conn.close()
     
     for tag in post['hashtags']:
         st.session_state.trending_hashtags[tag] = st.session_state.trending_hashtags.get(tag, 0) + 1
@@ -775,6 +975,11 @@ def delete_post(post_id: str, user: str) -> bool:
                 except Exception:
                     pass
             st.session_state.user_profile["posts"] -= 1
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("UPDATE users SET posts = posts - 1 WHERE username = ?", (user,))
+            conn.commit()
+            conn.close()
             return True
     return False
 
@@ -792,6 +997,10 @@ def save_post(post_id: str, user: str) -> bool:
 # -----------------------------
 def create_story(user: str, media_file, text: str = None, duration: int = 24) -> bool:
     """Create a new story."""
+    if not st.session_state.get("is_authenticated", False):
+        st.error("You must be logged in to create a story.")
+        return False
+    
     if not media_file:
         return False
     
@@ -870,17 +1079,33 @@ def mark_notifications_read():
 # -----------------------------
 def follow_user(user: str, to_follow: str) -> bool:
     """Follow a user."""
+    if not st.session_state.get("is_authenticated", False):
+        st.error("You must be logged in to follow users.")
+        return False
+    
     if user == to_follow:
         return False
     
     if (user, to_follow) in st.session_state.follows:
         st.session_state.follows.remove((user, to_follow))
         st.session_state.user_profile["following"] -= 1
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("UPDATE users SET following = following - 1 WHERE username = ?", (user,))
+        c.execute("UPDATE users SET followers = followers - 1 WHERE username = ?", (to_follow,))
+        conn.commit()
+        conn.close()
         add_notification(to_follow, f"{user} unfollowed you", "unfollow")
         return False
     else:
         st.session_state.follows.add((user, to_follow))
         st.session_state.user_profile["following"] += 1
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("UPDATE users SET following = following + 1 WHERE username = ?", (user,))
+        c.execute("UPDATE users SET followers = followers + 1 WHERE username = ?", (to_follow,))
+        conn.commit()
+        conn.close()
         add_notification(to_follow, f"{user} started following you", "follow")
         return True
 
@@ -903,75 +1128,6 @@ def toggle_theme():
     """Toggle between light and dark themes."""
     st.session_state.theme = "light" if st.session_state.theme == "dark" else "dark"
     st.rerun()
-
-def render_login():
-    """Render login sidebar."""
-    with st.sidebar:
-        st.title("👤 User Profile")
-        
-        avatar_col1, avatar_col2 = st.columns([1, 2])
-        with avatar_col1:
-            avatar = st.file_uploader("Upload avatar", type=IMAGE_EXTS, key="avatar_upload")
-            if avatar:
-                avatar_path = save_uploaded_file(avatar, subdir="avatars")
-                if avatar_path:
-                    st.session_state.user_profile["avatar"] = avatar_path
-        
-        with avatar_col2:
-            username = st.text_input(
-                "Username",
-                value=st.session_state.get("username", ""),
-                key="username_input",
-                help="Choose your username"
-            )
-            
-            if st.button("Set Username", key="set_username_btn"):
-                clean = username.strip()
-                if clean:
-                    st.session_state.username = clean
-                    st.success(f"Welcome, {clean}!")
-                else:
-                    st.error("Username cannot be empty.")
-        
-        bio = st.text_area("Bio", key="bio_input", 
-                          value=st.session_state.user_profile.get("bio", ""),
-                          placeholder="Tell everyone about yourself")
-        if bio:
-            st.session_state.user_profile["bio"] = bio
-        
-        if st.session_state.username:
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Posts", st.session_state.user_profile["posts"])
-            col2.metric("Followers", st.session_state.user_profile["followers"])
-            col3.metric("Following", st.session_state.user_profile["following"])
-        
-        st.markdown("---")
-        
-        st.title("🎨 Theme")
-        mode_label = "Light" if st.session_state.theme == "dark" else "Dark"
-        if st.button(f"Switch to {mode_label} Mode", key="toggle_theme_btn"):
-            toggle_theme()
-        
-        st.markdown("---")
-        st.title("🔔 Notifications")
-        unread = len(get_unread_notifications(st.session_state.username))
-        if unread > 0:
-            st.markdown(f'<span style="color: var(--accent); font-weight: bold;">{unread} unread</span>', 
-                       unsafe_allow_html=True)
-        
-        if st.button("Mark all as read", key="mark_read_btn"):
-            mark_notifications_read()
-            st.rerun()
-        
-        for notif in list(st.session_state.notifications)[-5:]:
-            st.caption(f"{notif['message']} - {format_timestamp(notif['timestamp'])}")
-
-def ensure_logged_in() -> bool:
-    """Check if user is logged in."""
-    if not st.session_state.get("username"):
-        st.warning("Please enter a username in the sidebar to use the app.")
-        return False
-    return True
 
 def render_stories():
     """Render stories carousel."""
@@ -1151,35 +1307,38 @@ def render_feed_page():
     
     render_stories()
     
-    with st.expander("Create a New Post", expanded=False):
-        with st.form("create_post_form", clear_on_submit=True):
-            text = st.text_area("What's happening?", key="post_text_input", 
-                               height=100, placeholder="Share your thoughts...")
-            
-            col1, col2, col3 = st.columns([2, 1, 1])
-            with col1:
-                media = st.file_uploader("Add media (video for reels recommended)", 
-                                       type=IMAGE_EXTS + VIDEO_EXTS + AUDIO_EXTS,
-                                       key="post_media_uploader")
-            with col2:
-                location = st.text_input("Location", key="post_location_input",
-                                       placeholder="Add location")
-            with col3:
-                is_sell = st.checkbox("For Sale", key="is_sell_checkbox")
-            
-            submitted = st.form_submit_button("📝 Post", use_container_width=True)
-            
-        if submitted:
-            if (text or "").strip() or media:
-                if create_post(st.session_state.username, text.strip() if text else "", 
-                              media, is_sell, location):
-                    st.success("Posted successfully!")
-                    st.rerun()
+    if st.session_state.get("is_authenticated", False):
+        with st.expander("Create a New Post", expanded=False):
+            with st.form("create_post_form", clear_on_submit=True):
+                text = st.text_area("What's happening?", key="post_text_input", 
+                                   height=100, placeholder="Share your thoughts...")
+                
+                col1, col2, col3 = st.columns([2, 1, 1])
+                with col1:
+                    media = st.file_uploader("Add media (video for reels recommended)", 
+                                           type=IMAGE_EXTS + VIDEO_EXTS + AUDIO_EXTS,
+                                           key="post_media_uploader")
+                with col2:
+                    location = st.text_input("Location", key="post_location_input",
+                                           placeholder="Add location")
+                with col3:
+                    is_sell = st.checkbox("For Sale", key="is_sell_checkbox")
+                
+                submitted = st.form_submit_button("📝 Post", use_container_width=True)
+                
+            if submitted:
+                if (text or "").strip() or media:
+                    if create_post(st.session_state.username, text.strip() if text else "", 
+                                  media, is_sell, location):
+                        st.success("Posted successfully!")
+                        st.rerun()
+                    else:
+                        st.error("Your post may contain inappropriate content or failed to upload.")
                 else:
-                    st.error("Your post may contain inappropriate content or failed to upload.")
-            else:
-                st.error("Post must contain text or media.")
-
+                    st.error("Post must contain text or media.")
+    else:
+        st.info("Log in to create a post.")
+    
     tab1, tab2, tab3 = st.tabs(["For You", "Following", "Reels"])
     
     with tab1:
@@ -1188,19 +1347,22 @@ def render_feed_page():
             st.info("No posts yet. Be the first to share something!")
         else:
             for post in list(st.session_state.feed_posts)[:20]:
-                render_post(post)
+                render_post(post, show_actions=st.session_state.get("is_authenticated", False))
     
     with tab2:
         st.subheader("Following")
-        following = get_following(st.session_state.username)
-        if not following:
-            st.info("You're not following anyone yet. Follow users to see their posts here.")
+        if not st.session_state.get("is_authenticated", False):
+            st.info("Log in to view posts from people you follow.")
         else:
-            following_posts = [p for p in st.session_state.feed_posts if p['user'] in following]
-            if not following_posts:
-                st.info("No posts from people you follow yet.")
-            for post in following_posts[:20]:
-                render_post(post)
+            following = get_following(st.session_state.username)
+            if not following:
+                st.info("You're not following anyone yet. Follow users to see their posts here.")
+            else:
+                following_posts = [p for p in st.session_state.feed_posts if p['user'] in following]
+                if not following_posts:
+                    st.info("No posts from people you follow yet.")
+                for post in following_posts[:20]:
+                    render_post(post)
     
     with tab3:
         st.subheader("Reels")
@@ -1222,34 +1384,35 @@ def render_feed_page():
             
             st.write(f"**{post['user']}**: {post['text']}")
             
-            col1, col2, col3, col4 = st.columns(4)
-            is_liked = (post['id'], st.session_state.username) in st.session_state.liked_posts
-            like_icon = "❤️" if is_liked else "🤍"
-            if col1.button(f"{like_icon} {post['likes']}"):
-                like_post(post['id'], st.session_state.username)
-                st.rerun()
-            
-            if col2.button(f"💬 {len(post['comments'])}"):
-                st.session_state[f"show_comments_{post['id']}"] = not st.session_state.get(f"show_comments_{post['id']}", False)
-                st.rerun()
-            
-            if col3.button(f"↗️ {post['shares']}"):
-                share_post(post['id'], st.session_state.username)
-                st.rerun()
-            
-            is_saved = (post['id'], st.session_state.username) in st.session_state.saved_posts
-            save_icon = "🔖" if is_saved else "📑"
-            if col4.button(save_icon):
-                save_post(post['id'], st.session_state.username)
-                st.rerun()
-            
-            if st.session_state.get(f"show_comments_{post['id']}"):
-                for comment in post['comments']:
-                    st.caption(f"**{comment['user']}**: {comment['text']}")
-                comment_text = st.text_input("Comment:")
-                if st.button("Post Comment"):
-                    comment_post(post['id'], st.session_state.username, comment_text)
+            if st.session_state.get("is_authenticated", False):
+                col1, col2, col3, col4 = st.columns(4)
+                is_liked = (post['id'], st.session_state.username) in st.session_state.liked_posts
+                like_icon = "❤️" if is_liked else "🤍"
+                if col1.button(f"{like_icon} {post['likes']}"):
+                    like_post(post['id'], st.session_state.username)
                     st.rerun()
+                
+                if col2.button(f"💬 {len(post['comments'])}"):
+                    st.session_state[f"show_comments_{post['id']}"] = not st.session_state.get(f"show_comments_{post['id']}", False)
+                    st.rerun()
+                
+                if col3.button(f"↗️ {post['shares']}"):
+                    share_post(post['id'], st.session_state.username)
+                    st.rerun()
+                
+                is_saved = (post['id'], st.session_state.username) in st.session_state.saved_posts
+                save_icon = "🔖" if is_saved else "📑"
+                if col4.button(save_icon):
+                    save_post(post['id'], st.session_state.username)
+                    st.rerun()
+                
+                if st.session_state.get(f"show_comments_{post['id']}"):
+                    for comment in post['comments']:
+                        st.caption(f"**{comment['user']}**: {comment['text']}")
+                    comment_text = st.text_input("Comment:")
+                    if st.button("Post Comment"):
+                        comment_post(post['id'], st.session_state.username, comment_text)
+                        st.rerun()
             
             col1, col2 = st.columns(2)
             if col1.button("Previous Reel"):
@@ -1343,41 +1506,44 @@ def render_sell_page():
     """Render the marketplace/sell page."""
     st.title("🛍️ Marketplace")
     
-    with st.expander("List an Item for Sale", expanded=False):
-        with st.form("sell_post_form", clear_on_submit=True):
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                title = st.text_input("Item Title", key="sell_title_input", placeholder="e.g., Vintage Sneakers")
-                price = st.text_input("Price", key="sell_price_input", placeholder="$0.00")
-                category = st.selectbox("Category", 
-                                      ["All", "Electronics", "Clothing", "Home", "Sports", "Beauty", "Toys", "Books", "Other"],
-                                      key="sell_category_input")
-            
-            with col2:
-                media = st.file_uploader("Product Media (video recommended)", type=IMAGE_EXTS + VIDEO_EXTS, 
-                                       accept_multiple_files=False, key="sell_media_uploader")
-                condition = st.selectbox("Condition", ["New", "Like New", "Good", "Fair"], key="sell_condition_input")
-                location = st.text_input("Location", key="sell_location_input", placeholder="e.g., New York, NY")
-            
-            description = st.text_area("Description", height=100, 
-                                     placeholder="Describe your item in detail (e.g., brand, features, condition)...",
-                                     key="sell_description_input")
-            
-            submitted = st.form_submit_button("List Item", use_container_width=True)
-            
-        if submitted:
-            if not title.strip() or not price.strip() or not description.strip():
-                st.error("Please fill in all required fields (title, price, description).")
-            else:
-                full_text = f"{description}\n\nPrice: {price}"
-                if create_post(st.session_state.username, full_text, media, 
-                              is_sell=True, location=location, title=title, 
-                              category=category, condition=condition):
-                    st.success("Item listed successfully!")
-                    st.rerun()
+    if st.session_state.get("is_authenticated", False):
+        with st.expander("List an Item for Sale", expanded=False):
+            with st.form("sell_post_form", clear_on_submit=True):
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    title = st.text_input("Item Title", key="sell_title_input", placeholder="e.g., Vintage Sneakers")
+                    price = st.text_input("Price", key="sell_price_input", placeholder="$0.00")
+                    category = st.selectbox("Category", 
+                                          ["All", "Electronics", "Clothing", "Home", "Sports", "Beauty", "Toys", "Books", "Other"],
+                                          key="sell_category_input")
+                
+                with col2:
+                    media = st.file_uploader("Product Media (video recommended)", type=IMAGE_EXTS + VIDEO_EXTS, 
+                                           accept_multiple_files=False, key="sell_media_uploader")
+                    condition = st.selectbox("Condition", ["New", "Like New", "Good", "Fair"], key="sell_condition_input")
+                    location = st.text_input("Location", key="sell_location_input", placeholder="e.g., New York, NY")
+                
+                description = st.text_area("Description", height=100, 
+                                         placeholder="Describe your item in detail (e.g., brand, features, condition)...",
+                                         key="sell_description_input")
+                
+                submitted = st.form_submit_button("List Item", use_container_width=True)
+                
+            if submitted:
+                if not title.strip() or not price.strip() or not description.strip():
+                    st.error("Please fill in all required fields (title, price, description).")
                 else:
-                    st.error("Could not create listing. Check content for inappropriate material.")
+                    full_text = f"{description}\n\nPrice: {price}"
+                    if create_post(st.session_state.username, full_text, media, 
+                                  is_sell=True, location=location, title=title, 
+                                  category=category, condition=condition):
+                        st.success("Item listed successfully!")
+                        st.rerun()
+                    else:
+                        st.error("Could not create listing. Check content for inappropriate material.")
+    else:
+        st.info("Log in to list an item for sale.")
     
     st.subheader("Browse Marketplace")
     sell_posts = [p for p in st.session_state.feed_posts if p.get("is_sell", False)]
@@ -1430,7 +1596,7 @@ def render_sell_page():
         index = st.session_state.current_marketplace_index % len(filtered_posts)
         post = filtered_posts[index]
         
-        render_post(post, show_actions=False, is_marketplace=True)
+        render_post(post, show_actions=st.session_state.get("is_authenticated", False), is_marketplace=True)
         
         col1, col2 = st.columns(2)
         if col1.button("Previous Item"):
@@ -1477,10 +1643,11 @@ def render_discover_page():
                 st.write(f"**{user}**")
                 user_posts = sum(1 for p in st.session_state.feed_posts if p['user'] == user)
                 st.caption(f"{user_posts} posts")
-                if st.button("Follow", key=f"follow_{user}"):
-                    follow_user(st.session_state.username, user)
-                    st.success(f"Now following {user}")
-                    st.rerun()
+                if st.session_state.get("is_authenticated", False):
+                    if st.button("Follow", key=f"follow_{user}"):
+                        follow_user(st.session_state.username, user)
+                        st.success(f"Now following {user}")
+                        st.rerun()
         st.markdown("---")
     
     st.subheader("Popular Content")
@@ -1548,8 +1715,8 @@ def render_notifications_page():
 
 def render_profile_page():
     """Render the user profile page."""
-    if not st.session_state.username:
-        st.warning("Please set a username first")
+    if not st.session_state.get("is_authenticated", False):
+        st.warning("Please log in to view your profile.")
         return
     
     st.title(f"👤 {st.session_state.username}'s Profile")
@@ -1583,10 +1750,12 @@ def render_profile_page():
             if col1.form_submit_button("Save Changes"):
                 if new_bio:
                     st.session_state.user_profile["bio"] = new_bio
+                    update_user_profile(st.session_state.username, bio=new_bio)
                 if new_avatar:
                     avatar_path = save_uploaded_file(new_avatar, subdir="avatars")
                     if avatar_path:
                         st.session_state.user_profile["avatar"] = avatar_path
+                        update_user_profile(st.session_state.username, avatar_path=avatar_path)
                 st.session_state.editing_profile = False
                 st.success("Profile updated!")
                 st.rerun()
@@ -1637,30 +1806,48 @@ def render_profile_page():
 # -----------------------------
 def main():
     """Main application entry point."""
-    render_login()
+    init_db()  # Initialize database
+    render_authentication()
     
-    if not ensure_logged_in():
-        st.info("👋 Welcome to SocialVerse! Enter a username in the sidebar to get started.")
-        return
-
-    page = st.sidebar.selectbox(
-        "Navigate",
-        ["🌐 Feed", "🔍 Discover", "💬 Messages", "🛍️ Marketplace", "🔔 Notifications", "👤 Profile"],
-        key="navigation_selectbox"
-    )
-
-    if page == "🌐 Feed":
-        render_feed_page()
-    elif page == "🔍 Discover":
-        render_discover_page()
-    elif page == "💬 Messages":
-        render_chat_page()
-    elif page == "🛍️ Marketplace":
-        render_sell_page()
-    elif page == "🔔 Notifications":
-        render_notifications_page()
-    elif page == "👤 Profile":
-        render_profile_page()
+    if st.session_state.get("is_authenticated", False):
+        page = st.sidebar.selectbox(
+            "Navigate",
+            ["🌐 Feed", "🔍 Discover", "💬 Messages", "🛍️ Marketplace", "🔔 Notifications", "👤 Profile"],
+            key="navigation_selectbox"
+        )
+        
+        if page == "🌐 Feed":
+            if ensure_logged_in():
+                render_feed_page()
+        elif page == "🔍 Discover":
+            if ensure_logged_in(allow_guest=True):
+                render_discover_page()
+        elif page == "💬 Messages":
+            if ensure_logged_in():
+                render_chat_page()
+        elif page == "🛍️ Marketplace":
+            if ensure_logged_in(allow_guest=True):
+                render_sell_page()
+        elif page == "🔔 Notifications":
+            if ensure_logged_in():
+                render_notifications_page()
+        elif page == "👤 Profile":
+            if ensure_logged_in():
+                render_profile_page()
+    else:
+        # Guest mode: limited access
+        page = st.sidebar.selectbox(
+            "Navigate",
+            ["🌐 Feed", "🔍 Discover", "🛍️ Marketplace"],
+            key="navigation_selectbox"
+        )
+        
+        if page == "🌐 Feed":
+            render_feed_page()
+        elif page == "🔍 Discover":
+            render_discover_page()
+        elif page == "🛍️ Marketplace":
+            render_sell_page()
 
 if __name__ == "__main__":
     main()
